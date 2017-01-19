@@ -62,6 +62,8 @@
 ;-----------------------
     UDATA_SHR ; 16 bytes of shared/global memory area 
 ;-----------------------
+palline     res 1
+twocnt      res 1
 lines       res 1   ; For the loop of the 7*32 active lines
 linecnt     res 1   ; Counting 7 lines for each pixel row (y)
 row         res 1   ; The current pixel low (y) 0..31
@@ -111,131 +113,12 @@ aaaa        res 1       ;
 ; Hardware-related constants
 #define AAAAAA      PORTA,0
 
+        
+        
 ;*******************************************************************************
-; Reset & Interrupt Vectors
-;*******************************************************************************
+; Macros
+;*******************************************************************************        
 
-RES_VECT CODE 0x0000        ; Processor reset vector
-    goto    Start           ; Jump to beginning of program
-
-ISR CODE 0x0004             ; Interrupt vector 
-    goto Interrupt          ; Jump to interrupt code
-
-;------------------------------------------------------------------------------
-; Lookup tables here near the start of code to avoid page wrapping
-;------------------------------------------------------------------------------
-
-;****************************************************************************
-; Convert a bit number (0..7) to a mask value
-;   Input: WREG
-;   Destroys:  WREG
-;   Banksel:  
-;****************************************************************************
-BitToMask:
-    brw
-    dt  1,2,4,8,16,32,64,128
-    
-
-
-;*******************************************************************************
-; INTERRUPT CODE
-;*******************************************************************************
-Interrupt:
-    bcf     INTCON,T0IF ;c; Clear the timer interrupt flag        
-
-    retfie
-
-;*******************************************************************************
-; MAIN PROGRAM
-;*******************************************************************************
-MAIN_PROG CODE
-    
-Start:
-; Setup peripheral registers in the PIC
-
-;             +--------- SPLLEN Software PLL Enable bit
-;             |+-------- IRCF3 Internal Oscillator Frequency Select
-;             ||+------- IRCF2
-;             |||+------ IRCF1
-;             ||||+----- IRCF0
-;             |||||+---- n/a
-;             ||||||+--- SCS1 System Clock Select
-;             |||||||+-- SCS0
-;             ||||||||    
-    movlw   B'11110000'     ; Internal 32MHz oscillator
-    banksel OSCCON          
-    movwf   OSCCON          ;1;
-    
-;    Setup Timer0 to generate interrupts at 64 us (15625 Hz) intervals
-;
-;       fOsc/4      Prescale     8bit counter 
-;    32000000/4 -> 8000000/2 -> 4000000/256 -> 15625H z 
-   
-;             +--------- /WPUEN  Weak Pull-Up Enable
-;             |+-------- INTEDG Interrupt Edge Select
-;             ||+------- TMR0CS Timer0 Clock Source Select
-;             |||+------ TMR0SE Timer0 Source Edge Select
-;             ||||+----- PSA    Prescaler Assignment
-;             |||||+---- PS2
-;             ||||||+--- PS1
-;             |||||||+-- PS0    Prescaler Rate Select
-;             ||||||||    
-    movlw   B'00000110'
-    banksel OPTION_REG
-    movwf   OPTION_REG      
-
-;             +--------- GIE    Global Interrupt Enable
-;             |+-------- PEIE   Peripheral Interrupt Enable
-;             ||+------- TMR0IE Timer0 Overflow Interrupt Enable
-;             |||+------ INTE   INT External Interrupt Enable
-;             ||||+----- IOCIE  Interrupt-on-Change Enable
-;             |||||+---- TMR0IF Timer0 Overflow Interrupt Flag
-;             ||||||+--- INTF   INT External Interrupt Flag
-;             |||||||+-- IOCIF  Interrupt-on-Change Interrupt Flag
-;             ||||||||    
-    movlw   B'10100000'
-    movwf   INTCON      ;c;    
-    
-    banksel ANSELA
-    clrf    ANSELA          ;3; All GPIOs are digital
-    clrf    ANSELC          ;3;
-    
-    banksel  TRISC
-    clrf    TRISC           ;   Entire gpio C is output
-    bcf     TRISA,0         ;   Gpio A.0 is output
-
-    banksel LATA
-    movlw   HIGH(videobuf)
-    movwf   FSR0H
-    clrf    FSR0L 
-    movlw   16
-    movwf   d1
-apa movlw   0x55
-    movwi   FSR0++
-    movwi   FSR0++
-    movwi   FSR0++
-    movwi   FSR0++
-    movwi   FSR0++
-    movwi   FSR0++
-    movwi   FSR0++
-    movwi   FSR0++
-    movlw   0xAA
-    movwi   FSR0++
-    movwi   FSR0++    
-    movwi   FSR0++
-    movwi   FSR0++
-    movwi   FSR0++
-    movwi   FSR0++
-    movwi   FSR0++
-    movwi   FSR0++
-    decfsz  d1
-    goto    apa
-
-    
-    
-    bcf     SOUND
-    goto    Main
-    
 outpixel0 macro              ; 0.625 us
     moviw   FSR0++      ;1
     movwf   LATA        ;1
@@ -281,15 +164,968 @@ out64pixels macro       ; TOTAL 40.250 us
     bcf     LATA,0      ; 0.125 us Output black for the rest of the line
  endm
 
+        
+        
+;*******************************************************************************
+; Reset & Interrupt Vectors
+;*******************************************************************************
 
-dly7cycles:             
+RES_VECT CODE 0x0000        ; Processor reset vector
+    goto    Start           ; Jump to beginning of program
+
+ISR CODE 0x0004             ; Interrupt vector 
+    goto Interrupt          ; Jump to interrupt code
+
+;------------------------------------------------------------------------------
+; Lookup tables here near the start of code to avoid page wrapping
+;------------------------------------------------------------------------------
+
+;****************************************************************************
+; Convert a bit number (0..7) to a mask value
+;   Input: WREG
+;   Destroys:  WREG
+;   Banksel:  
+;****************************************************************************
+BitToMask:
+    brw
+    dt  1,2,4,8,16,32,64,128
+    
+;
+; This table computes the jump to the right type of horizontal line to output.
+; The non-interlaced PAL standard is 312 lines but that value is larger that
+; can fit in a 8 bit variable the current line number is divided by two before
+; jumping to this function. So each entry handles two consecutive lines. (But
+; are still called twice, with the same line number). The line counter is 
+; counting backwards from 156 down to 1 due to speed reasons in the loop, this
+; table is reversed and have a dummy first entry since 0 is not used.
+LineJumpTable:
+    brw
+    nop                 ; Dummy to adjust for 0 not being in the loop values
+
+    goto    HSYNCLINE   ; 38 hsyncs
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+
+    goto    VIDEOLINE   ;224 video
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    goto    VIDEOLINE   
+    
+    goto    HSYNCLINE   ; 46 hsyncs
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    goto    HSYNCLINE    
+    
+    goto    VSYNCLINE   ; 4 vsyncs
+    goto    VSYNCLINE    
+    
+    
+HSYNCLINE:              ; 16 cycles since sync was activated
+    call    dly16c      ; 16 cycles
+    bsf     SYNCS       ;  1 Set sync inactive
+    retfie
+
+    
+VSYNCLINE:              ;  16 cycles since sync was activated
+    call    dly238c     ; 238
+    bsf     SYNCS       ;   1 Set sync inactive
+    call    dly15c      ;  15
+    bcf     SYNCS       ;   1 Pull sync low again
+    call    dly238c     ; 238
+    bsf     SYNCS       ;   1 Set sync inactive
+    retfie
+    
+    
+VIDEOLINE:              ;  16 cycles since sync was activated
+    call    dly16c      ;  16 cycles
+    bsf     SYNCS       ;   1 Set sync inactive
+; Calculate the address into the videobuffer to read from at this line
+    ; TOTAL time is 10 cycles = 1.250 us
+    ;                   Path1   Path2
+    decfsz  linecnt     ;1      2
+    goto    nonew       ;2
+    incf    row         ;       1
+    movlw   7           ;       1    
+    movwf   linecnt     ;       1
+    goto    setfsr      ;       2
+nonew:                  
+    call    dly4c  ;4
+setfsr:
+    movlw   HIGH(videobuf);1    1 
+    movwf   FSR0H
+    movfw   row         ;1      1
+    movwf   FSR0L       ;1      1
+    lslf    FSR0L       ;1      1   ; Multiply by 8   
+    lslf    FSR0L       ;1      1   
+    lslf    FSR0L       ;1      1   
+    ;                   ==========
+    ;                   13     13
+    call    dly16c
+    call    dly31c
+    call    dly31c
+    out64pixels         ; 322 cycles = 40.250 us
+    retfie
+    
+    
+;*******************************************************************************
+; INTERRUPT CODE
+;*******************************************************************************
+Interrupt:
+
+; The next two instructions are used to eliminate jitter on the
+; interrupt timing. When the interrupt occurs, it may have to wait
+; an extra cycle becuase a two cycle instruction is in progress.
+;
+; We can tell the difference by looking at the least significant
+; bit of TMR2. If the next instruction skips we use 2 cycles, if it
+; doesn't skip then we use 3 cycles. The net result is that we add
+; a cycle when needed so that we always get to 'dejittered' at the
+; exact same time relative to the actual rollover of TMR2!
+;
+
+    banksel TMR2
+    btfss   TMR2,0
+    bra     dejittered
+dejittered:
+    
+    banksel PIR1       
+    bcf     PIR1,TMR2IF ; Clear TMR2IF -TMR2 to PR2 Match Interrupt Flag
+
+    banksel LATC        
+    bcf     SYNCS       ; 1 Pull sync low
+
+;                             EVEN ODD  ROLL
+;                           ----------------
+    incf    twocnt          ; 1    1    1 
+    btfss   twocnt,0        ; 1    2    1
+    goto    J2              ; 2         2
+    goto    $+1             ;      2
+    goto    J3              ;      2
+J2  decfsz  palline         ; 1         2
+    goto    J3              ; 2
+    movlw   D'312'/2        ;           1
+    movwf   palline         ;           1
+    goto    LineJumpTable   ;           2
+J3  movfw   palline         ; 1    1
+    goto    LineJumpTable   ; 2    2
+;                            -------------
+;                      Total 10   10   10
+
+;*******************************************************************************
+; MAIN PROGRAM
+;*******************************************************************************
+MAIN_PROG CODE
+    
+Start:
+; Setup peripheral registers in the PIC
+
+;             +--------- /WPUEN  Weak Pull-Up Enable
+;             |+-------- INTEDG Interrupt Edge Select
+;             ||+------- TMR0CS Timer0 Clock Source Select
+;             |||+------ TMR0SE Timer0 Source Edge Select
+;             ||||+----- PSA    Prescaler Assignment
+;             |||||+---- PS2
+;             ||||||+--- PS1
+;             |||||||+-- PS0    Prescaler Rate Select
+;             ||||||||    
+    movlw   B'00000000'
+    banksel OPTION_REG
+    movwf   OPTION_REG      
+
+;             +--------- SPLLEN Software PLL Enable bit
+;             |+-------- IRCF3 Internal Oscillator Frequency Select
+;             ||+------- IRCF2
+;             |||+------ IRCF1
+;             ||||+----- IRCF0
+;             |||||+---- n/a
+;             ||||||+--- SCS1 System Clock Select
+;             |||||||+-- SCS0
+;             ||||||||    
+    movlw   B'11110000'     ; Internal 32MHz oscillator
+    banksel OSCCON          
+    movwf   OSCCON          ;1;
+    
+;    Setup Timer2 to generate interrupts at 64 us (15625 Hz) intervals
+;
+    
+;             +--------- n/a
+;             |+-------- T2OUTPS3 Timer2 Postcaler 
+;             ||+------- T2OUTPS2
+;             |||+------ T2OUTPS1
+;             ||||+----- T2OUTPS0
+;             |||||+---- TMR2ON   Timer2 Enable
+;             ||||||+--- T2CKPS1  Timer2 Prescaler
+;             |||||||+-- T2CKPS0
+;             ||||||||    
+    movlw   B'00011100' ; Pre/1 Post/4, Enable
+    banksel T2CON
+    movwf   T2CON
+
+    movlw   0x7F        ; Timer2 Match value = 64uS
+    banksel PR2
+    movwf   PR2
+    
+    banksel PIR1
+    bcf     PIR1,TMR2IF     ; Clear timer2 interupt flag TMR2IF
+    clrf    PIR1
+    
+    banksel PIE1
+    bsf PIE1,TMR2IE     ; Enable Timer2 interrupts
+
+;             +--------- GIE    Global Interrupt Enable
+;             |+-------- PEIE   Peripheral Interrupt Enable
+;             ||+------- TMR0IE Timer0 Overflow Interrupt Enable
+;             |||+------ INTE   INT External Interrupt Enable
+;             ||||+----- IOCIE  Interrupt-on-Change Enable
+;             |||||+---- TMR0IF Timer0 Overflow Interrupt Flag
+;             ||||||+--- INTF   INT External Interrupt Flag
+;             |||||||+-- IOCIF  Interrupt-on-Change Interrupt Flag
+;             ||||||||    
+    movlw   B'11000000'
+    banksel INTCON
+    movwf   INTCON          
+    
+    banksel ANSELA
+    clrf    ANSELA          ; All GPIOs are digital
+    clrf    ANSELC          ;
+    
+    banksel TRISC
+    clrf    TRISC           ; Entire gpio C is output
+    bcf     TRISA,0         ; Gpio A.0 is output
+
+    
+    movlw   D'312'/2
+    movwf   palline
+    clrf    twocnt
+
+    clrf    row
+    movlw   7
+    movwf   linecnt
+    
+    
+    banksel LATA
+    movlw   HIGH(videobuf)
+    movwf   FSR0H
+    clrf    FSR0L 
+    movlw   16
+    movwf   d1
+apa movlw   0x00    ;movlw   0x55
+    movwi   FSR0++
+    movwi   FSR0++
+    movwi   FSR0++
+    movwi   FSR0++
+    movwi   FSR0++
+    movwi   FSR0++
+    movwi   FSR0++
+    movwi   FSR0++
+    movlw   0x00;   movlw   0xAA
+    movwi   FSR0++
+    movwi   FSR0++    
+    movwi   FSR0++
+    movwi   FSR0++
+    movwi   FSR0++
+    movwi   FSR0++
+    movwi   FSR0++
+    movwi   FSR0++
+    decfsz  d1
+    goto    apa
+
+    movlw   HIGH(videobuf)
+    movwf   FSR0H
+    movlw   0x00
+    movwf   FSR0L
+    movlw   0x81
+    movwi   FSR0++
+    
+    movlw   HIGH(videobuf)
+    movwf   FSR0H
+    movlw   0xFF
+    movwf   FSR0L
+    movlw   0xC3
+    movwi   FSR0++
+
+    movlw   HIGH(videobuf)
+    movwf   FSR0H
+    movlw   0x00
+    movwf   FSR0L
+
+    movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00011100'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00111000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00111000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00011100'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'01110000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00001110'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'01110000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00001110'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'01111000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00011110'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'01111100'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00111110'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'11111111'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'11111111'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'11111111'
+	movwi	FSR0++
+	movlw	B'00000011'
+	movwi	FSR0++
+	movlw	B'11000000'
+	movwi	FSR0++
+	movlw	B'11111111'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'11111110'
+	movwi	FSR0++
+	movlw	B'00000111'
+	movwi	FSR0++
+	movlw	B'11100000'
+	movwi	FSR0++
+	movlw	B'11111111'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'11100000'
+	movwi	FSR0++
+	movlw	B'11111011'
+	movwi	FSR0++
+	movlw	B'11001111'
+	movwi	FSR0++
+	movlw	B'00000111'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'11000000'
+	movwi	FSR0++
+	movlw	B'11111101'
+	movwi	FSR0++
+	movlw	B'10111111'
+	movwi	FSR0++
+	movlw	B'00000011'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'11111110'
+	movwi	FSR0++
+	movlw	B'10111111'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'11111111'
+	movwi	FSR0++
+	movlw	B'01111111'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'11111111'
+	movwi	FSR0++
+	movlw	B'11111111'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'11111111'
+	movwi	FSR0++
+	movlw	B'11111111'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'11000011'
+	movwi	FSR0++
+	movlw	B'11000011'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'10000011'
+	movwi	FSR0++
+	movlw	B'11000001'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'11100011'
+	movwi	FSR0++
+	movlw	B'11000111'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'11110011'
+	movwi	FSR0++
+	movlw	B'11001111'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'11111111'
+	movwi	FSR0++
+	movlw	B'11111111'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'11111111'
+	movwi	FSR0++
+	movlw	B'11111111'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'01000000'
+	movwi	FSR0++
+	movlw	B'01111111'
+	movwi	FSR0++
+	movlw	B'01111110'
+	movwi	FSR0++
+	movlw	B'00000010'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'11100000'
+	movwi	FSR0++
+	movlw	B'01111110'
+	movwi	FSR0++
+	movlw	B'01111110'
+	movwi	FSR0++
+	movlw	B'00000111'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'11111110'
+	movwi	FSR0++
+	movlw	B'11111101'
+	movwi	FSR0++
+	movlw	B'10111111'
+	movwi	FSR0++
+	movlw	B'11111111'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'11111111'
+	movwi	FSR0++
+	movlw	B'11111011'
+	movwi	FSR0++
+	movlw	B'11011111'
+	movwi	FSR0++
+	movlw	B'11111111'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'11111111'
+	movwi	FSR0++
+	movlw	B'10111001'
+	movwi	FSR0++
+	movlw	B'10011101'
+	movwi	FSR0++
+	movlw	B'11111111'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'11111100'
+	movwi	FSR0++
+	movlw	B'10010000'
+	movwi	FSR0++
+	movlw	B'00001001'
+	movwi	FSR0++
+	movlw	B'00111110'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'01111000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00011110'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'01110000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00001110'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'01110000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00001110'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00111000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00011100'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+	movlw	B'00000001'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00011100'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'00111000'
+	movwi	FSR0++
+	movlw	B'00000000'
+	movwi	FSR0++
+	movlw	B'10000000'
+	movwi	FSR0++
+
+Main:
+    bcf     SOUND
+    call    Delay500ms
+    bsf     SOUND
+    call    Delay500ms
+    goto    Main
+
+    
+    
+    
+
+dly7c:             
      goto   $+1           
-dly5cycles:             
+dly5c:             
      nop                
-dly4cycles:             
+dly4c:             
      return              
      
-dly15cycles:            
+dly16c:            
+     nop
+dly15c:            
     movlw   0x03          
     movwf   WREG
     decfsz  WREG
@@ -297,7 +1133,7 @@ dly15cycles:
     nop
     return               
 
-dly31cycles:
+dly31c:
     movlw   0x08          
     movwf   WREG
     decfsz  WREG
@@ -306,19 +1142,19 @@ dly31cycles:
     return               
     
     
-dly238cycles:
+dly238c:
     goto    $+1
     goto    $+1
     goto    $+1
     goto    $+1
-dly230cycles:
+dly230c:
     movlw   0x4B
     movwf   WREG
     decfsz  WREG
     goto    $-1
     return               
 
-dly469cycles:
+dly469c:
     movlw   0x9A          
     movwf   WREG
     decfsz  WREG
@@ -356,111 +1192,6 @@ dly6.000:               ; 0.125*48= 6.000 us
     nop                 ;1 cycle
     return              ;4 cycles (including call)
 
-outhsync macro       
-    banksel LATC        ; 0.125 
-    bcf     SYNCS       ; 0.125 Pull sync low
-    ;
-    ; Hold the sync pulse low for 4.375uS (35 cycles)
-    ; While doing that we can  Keep track of the current video line during 
-    ; the active video period and update the FSR0 registers to point to the 
-    ; right place in the video buffer for each line.
-    ;
-    ; TOTAL time is 10 cycles = 1.250 us
-    ;                   Path1   Path2
-    decfsz  linecnt     ;1      2
-    goto    nonew       ;2
-    incf    row         ;       1
-    movlw   7           ;       1    
-    movwf   linecnt     ;       1
-    goto    setfsr      ;       2
-nonew:                  
-    call    dly4cycles  ;4
-setfsr:
-    movlw   HIGH(videobuf);1    1 
-    movwf   FSR0H
-    movfw   row         ;1      1
-    movwf   FSR0L       ;1      1
-    lslf    FSR0L       ;1      1   ; Multiply by 8   
-    lslf    FSR0L       ;1      1   
-    lslf    FSR0L       ;1      1   
-    ;                   ==========
-    ;                   13     13
-    ; Delay for another 21 cycles
-    call    dly5cycles  ;5
-    call    dly5cycles  ;5
-    call    dly5cycles  ;5
-    call    dly5cycles  ;5
-
-    nop                 ;1
-
-    bsf     SYNCS     ; 0.125 Set sync high
- endm    
-
- 
- 
-; 312 lines, 287 video, 230 safe video
-; 32 vertical pixels @ 7 rows = 224 lines
-; 32 vertical pixels @ 8 rows = 256 lines
-
- 
-onepixelline:
-    outhsync            ;  4.750 us Hsync
-    call    dly5.750    ;  5.750 us Backporch
-    call    dly6.000    ;  6.000 us Video - Left margin
-    out64pixels         ; 40.250 us Video - Pixels
-    call    dly5.750    ;  5.750 us Video - Right margin
-    ; Frontporch is 1.500 us but the 2+2 cycles (0.500 us) for call/return
-    ; as well as the loop overhead of 5 cycles (0.375 us) needs to be 
-    ; adjusted for so only 0.625 us is needed
-    goto    $+1         ; 0.250 Frontporch
-    nop                 ; 0.125 Frontporch
-    return
-
-onevideoline:           ;   2 cycles (call)
-    banksel LATC        ;   1 
-    bcf     SYNCS       ;   1 Pull sync low
-    call    dly31cycles ;   31
-    bsf     SYNCS       ;   1 Sync high again
-    call    dly469cycles; 469
-    return              ;   2 cycles
-
-SyncLongShortLine:
-SyncShortLine:
-SyncLongLine:           ;   2 cycles (call) 
-    banksel LATC        ;   1 
-    bcf     SYNCS       ;   1 Pull sync low
-    call    dly238cycles; 238
-    bsf     SYNCS       ;   1 Sync high again
-    call    dly15cycles ;  15
-    bcf     SYNCS       ;   1 Pull sync low
-    call    dly238cycles; 238
-    bsf     SYNCS       ;   1 Sync high again
-    call    dly7cycles  ;   7
-    return              ;   2 cycles
-
-;SyncLongShortLine
-;    banksel LATC        ;   1 
-;    bcf     SYNCS       ;   1 Pull sync low
-;    call    dly238cycles; 238
-;    bsf     SYNCS       ;   1 Sync high again
-;    call    dly15cycles ;  15
-;    bcf     SYNCS       ;   1 Pull sync low
-;    call    dly15cycles ;  15
-;    bsf     SYNCS       ;   1 Sync high again
-;    call    dly230cycles; 230
-;    return              ;   2 cycles
-    
-;SyncShortLine
-;    banksel LATC        ;   1 
-;    bcf     SYNCS       ;   1 Pull sync low
-;    call    dly15cycles ;  15
-;    bsf     SYNCS       ;   1 Sync high again
-;    call    dly238cycles; 238
-;    bcf     SYNCS       ;   1 Pull sync low
-;    call    dly15cycles ;  15
-;    bsf     SYNCS       ;   1 Sync high again
-;    call    dly230cycles; 230
-;    return              ;   2 cycles
     
 ScanKeyMatrix:
     banksel LATC
@@ -528,10 +1259,6 @@ ScanKeyMatrix:
 ;   7 8 9 C   7 8 9 E   3 7 B F
 ;   * 0 # D   A 0 B F   2 6 A E
     
-Main:
-    clrf    row
-    movlw   7
-    movwf   linecnt
 
 Loop:                       ; We should get here every 159744 cycles
     banksel PORTA
@@ -555,81 +1282,6 @@ Loop:                       ; We should get here every 159744 cycles
     incf    FSR0L
     movlw   0xF0
     movwf   INDF0
-
-
-    call    SyncLongLine
-    call    dly5cycles
-
-    call    SyncLongLine
-    call    dly5cycles
-
-    call    SyncLongShortLine
-    call    dly5cycles
-    
-    call    SyncShortLine
-    call    dly5cycles
-    
-    call    SyncShortLine
-    nop
-    nop
-    nop
-    movlw   40-1            ;1
-    movwf   lines           ;1
-
-LoopVideoLines1:
-    call    onevideoline    ;507    507
-    nop                     ;1      1
-    nop                     ;1      1
-    decfsz  lines           ;1      2
-    goto    LoopVideoLines1 ;2      
-    nop                     ;       1
-
-    call    onevideoline    ;507    507 The last needs to be handled special
-    nop
-    nop
-    nop
-    movlw   32*7-1          ;1
-    movwf   lines           ;1
-
-LoopActiveLines:
-    call    onepixelline    ;507    507
-    nop                     ;1      1
-    nop                     ;1      1
-    decfsz  lines           ;1      2
-    goto    LoopActiveLines ;2      
-    nop                     ;       1
-
-    call    onepixelline    ;507    507 Handle the last line specially
-    nop
-    nop
-    nop
-    movlw   40-1            ;1
-    movwf   lines           ;1
-
-LoopVideoLines2:
-    call    onevideoline    ;507    507
-    nop                     ;1      1
-    nop                     ;1      1
-    decfsz  lines           ;1      2
-    goto    LoopVideoLines2 ;2      
-    nop                     ;       1
-
-    call    onevideoline    ;507    507 The last needs to be handled special
-    call    dly5cycles
-
-    call    SyncShortLine
-    call    dly5cycles
-
-    call    SyncShortLine
-    call    dly5cycles
-    
-    call    SyncShortLine
-    nop
-    nop
-    nop
-    goto    Loop
-
-    
     
 Delay500ms:    
     movlw	0x23
