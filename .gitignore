@@ -1,0 +1,46 @@
+#
+# Editor backup files
+#
+*.bak
+*~
+DEADJOE
+
+#
+# Generic files
+#
+*.tmp
+
+#
+# OS junk files
+#
+[Tt]humbs.db
+*.DS_Store
+
+#
+# MPLAB X files
+#
+___*.fil
+*.d
+*.pre
+*.p1
+*.lst
+*.sym
+*.obj
+*.o
+*.sdb
+*.obj.dmp
+*.map
+html/
+build/
+nbbuild/
+dist/
+nbdist/
+nbactions.xml
+nb-configuration.xml
+funclist
+disassembly/
+**/nbproject/**
+!**/nbproject/configurations.xml
+!**/nbproject/project.properties
+!**/nbproject/project.xml
+/Asm/Tetradeca.X/nbproject/private/
