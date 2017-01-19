@@ -13,6 +13,8 @@
                    displayName="Source Files"
                    projectFiles="true">
       <itemPath>main.asm</itemPath>
+      <itemPath>hadlogo.inc</itemPath>
+      <itemPath>checkerboard.inc</itemPath>
     </logicalFolder>
     <logicalFolder name="ExternalFiles"
                    displayName="Important Files"
