@@ -62,14 +62,7 @@
 ;-----------------------
     UDATA_SHR ; 16 bytes of shared/global memory area 
 ;-----------------------
-palline     res 1
-twocnt      res 1
-lines       res 1   ; For the loop of the 7*32 active lines
-linecnt     res 1   ; Counting 7 lines for each pixel row (y)
-row         res 1   ; The current pixel low (y) 0..31
-d1          res 1
-d2          res 1
-d3          res 1
+cnt         res 1   ; General counter variable
 
 ;*******************************************************************************
 ; Variables in individual bank memories
@@ -78,17 +71,19 @@ d3          res 1
 ;-----------------------
 bank0 UDATA 0*0x80+0x20 ; Bank 0 PORT/TMRx
 ;-----------------------
-aa          res 1       ;                                                   
 
 ;-----------------------
 bank1 UDATA 1*0x80+0x20 ; Bank 1 TRIS/PIE/OPTION_REG/ADCCONx
 ;-----------------------
-aaa         res 1       ; 
 
 ;-----------------------
 bank2 UDATA 2*0x80+0x20 ; Bank 2 LAT/CMx/DAC
 ;-----------------------
-aaaa        res 1       ; 
+tvLine      res 1   ; ISR - counts 156..1 for tv lines
+tvLine2     res 1   ; ISR - counts even/odd to double call the tvLines
+row         res 1   ; ISR - The current pixel row (y) 0..31
+lines       res 1   ; ISR - For the loop of the 7*32 active lines
+linecnt     res 1   ; ISR - Counting 7 lines for each pixel row (y)
 
 ;-----------------------
 ; Linear memory region 0x2000..0x29AF
@@ -106,65 +101,53 @@ aaaa        res 1       ;
 
 #define videobuf  0x2100    ; 0x100 bytes for 64 columns, 32 lines of 1 bpp video buffer
         
-;-----------------------
-; Constants
-#define AAAAA       16  ;                                   
-
-; Hardware-related constants
-#define AAAAAA      PORTA,0
-
         
         
 ;*******************************************************************************
 ; Macros
 ;*******************************************************************************        
 
-outpixel0 macro              ; 0.625 us
-    moviw   FSR0++      ;1
-    movwf   LATA        ;1
-
-    nop                 ;3
-    nop
-    nop
- endm
-
-outnextpixel macro              ; 0.625 us
-    lsrf    WREG        ;1
-    movwf   LATA        ;1
-
-    nop                 ;3
-    nop
-    nop
- endm
-
 ; lSdddrSdddrSdddrSdddrSdddrSdddrSdddrSddd
 ; .^....^....^....^....^....^....^....^...
- 
-out8pixels macro           ; 8x5 cycles = 5.000 us  
-    outpixel0           ;5
-    outnextpixel        ;5
-    outnextpixel        ;5
-    outnextpixel        ;5
-    outnextpixel        ;5
-    outnextpixel        ;5
-    outnextpixel        ;5
-    outnextpixel        ;5
- endm
- 
-out64pixels macro       ; TOTAL 40.250 us
-    out8pixels          ; 5.000 us
-    out8pixels          ; 5.000 us
-    out8pixels          ; 5.000 us
-    out8pixels          ; 5.000 us
-    out8pixels          ; 5.000 us
-    out8pixels          ; 5.000 us
-    out8pixels          ; 5.000 us
-    out8pixels          ; 5.000 us
-    nop                 ; 0.125 us 
-    bcf     LATA,0      ; 0.125 us Output black for the rest of the line
+
+outFirstPixelM macro    ; 5 cycles (0.625 us)
+    moviw   FSR0++      ; 1
+    movwf   LATA        ; 1
+    goto    $+1         ; 2
+    nop                 ; 1
  endm
 
-        
+outNextPixelM macro     ; 5 cycles (0.625 us)
+    lsrf    WREG        ; 1
+    movwf   LATA        ; 1
+    goto    $+1         ; 2
+    nop                 ; 1
+ endm
+
+out8pixelsM macro       ; 40 cycles (5.000 us)
+    outFirstPixelM      ; 5
+    outNextPixelM       ; 5
+    outNextPixelM       ; 5
+    outNextPixelM       ; 5
+    outNextPixelM       ; 5
+    outNextPixelM       ; 5
+    outNextPixelM       ; 5
+    outNextPixelM       ; 5
+ endm
+ 
+out64pixels macro       ; 322 cycles (40.250 us)
+    out8pixelsM         ; 40
+    out8pixelsM         ; 40
+    out8pixelsM         ; 40
+    out8pixelsM         ; 40
+    out8pixelsM         ; 40
+    out8pixelsM         ; 40
+    out8pixelsM         ; 40
+    out8pixelsM         ; 40
+    nop                 ;  1 The last pixel need one extra cycle to be full
+    bcf     LATA,0      ;  1 Output black for the rest of the line
+ endm
+
         
 ;*******************************************************************************
 ; Reset & Interrupt Vectors
@@ -198,7 +181,7 @@ BitToMask:
 ; are still called twice, with the same line number). The line counter is 
 ; counting backwards from 156 down to 1 due to speed reasons in the loop, this
 ; table is reversed and have a dummy first entry since 0 is not used.
-LineJumpTable:
+TvLineJumpTable:
     brw
     nop                 ; Dummy to adjust for 0 not being in the loop values
 
@@ -426,31 +409,34 @@ Interrupt:
 ; exact same time relative to the actual rollover of TMR2!
 ;
 
-    banksel TMR2
-    btfss   TMR2,0
-    bra     dejittered
-dejittered:
+;    banksel TMR2
+;    btfss   TMR2,0
+;    bra     dejittered
+;dejittered:
     
     banksel PIR1       
     bcf     PIR1,TMR2IF ; Clear TMR2IF -TMR2 to PR2 Match Interrupt Flag
 
-    banksel LATC        
+    banksel LATC        ; This bank holds ISR variables and the GPIO LAT
+                        ; and is being used for everything in the ISR from 
+                        ; this point forwards
+
     bcf     SYNCS       ; 1 Pull sync low
 
 ;                             EVEN ODD  ROLL
 ;                           ----------------
-    incf    twocnt          ; 1    1    1 
-    btfss   twocnt,0        ; 1    2    1
+    incf    tvLine2         ; 1    1    1 
+    btfss   tvLine2,0       ; 1    2    1
     goto    J2              ; 2         2
     goto    $+1             ;      2
     goto    J3              ;      2
-J2  decfsz  palline         ; 1         2
+J2  decfsz  tvLine          ; 1         2
     goto    J3              ; 2
     movlw   D'312'/2        ;           1
-    movwf   palline         ;           1
-    goto    LineJumpTable   ;           2
-J3  movfw   palline         ; 1    1
-    goto    LineJumpTable   ; 2    2
+    movwf   tvLine          ;           1
+    goto    TvLineJumpTable ;           2
+J3  movfw   tvLine          ; 1    1
+    goto    TvLineJumpTable ; 2    2
 ;                            -------------
 ;                      Total 10   10   10
 
@@ -538,12 +524,12 @@ Start:
 
     
     movlw   D'312'/2
-    movwf   palline
-    clrf    twocnt
+    movwf   tvLine
+    clrf    tvLine2
 
     clrf    row
-    movlw   7
-    movwf   linecnt
+    movlw   8           ; Start at 8 instead of 7 because of pre-decrement
+    movwf   linecnt     ; in the video line handler
     
     include "checkerboard.inc"
     include "hadlogo.inc"
@@ -724,29 +710,6 @@ ScanKeyMatrix:
     retlw 0xFF
 
     
-
-    
-Delay500ms:    
-    movlw	0x23/10
-    movlw   1
-    movwf	d1
-	movlw	0xB9
-	movwf	d2
-	movlw	0x09
-	movwf	d3
-Delay500ms_0
-	decfsz	d1, f
-	goto	$+2
-	decfsz	d2, f
-	goto	$+2
-	decfsz	d3, f
-	goto	Delay500ms_0
-
-			;6 cycles
-	goto	$+1
-	goto	$+1
-	goto	$+1
-    return
     
 ;****************************************************************************
 ; Random - 16 bit random number generator

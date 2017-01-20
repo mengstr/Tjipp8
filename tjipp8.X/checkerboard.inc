@@ -3,7 +3,7 @@
     movwf   FSR0H
     clrf    FSR0L 
     movlw   16
-    movwf   d1
+    movwf   cnt
 cb  movlw   0x55
     movwi   FSR0++
     movwi   FSR0++
@@ -22,5 +22,5 @@ cb  movlw   0x55
     movwi   FSR0++
     movwi   FSR0++
     movwi   FSR0++
-    decfsz  d1
+    decfsz  cnt
     goto    cb
