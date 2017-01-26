@@ -9,6 +9,7 @@ DEADJOE
 # Generic files
 #
 *.tmp
+/tmp
 
 #
 # OS junk files
